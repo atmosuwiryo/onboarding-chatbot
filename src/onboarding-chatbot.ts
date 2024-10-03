@@ -2,6 +2,7 @@ import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from '@langchain/
 import { ChatAnthropic } from '@langchain/anthropic';
 import { StateGraph } from '@langchain/langgraph';
 import { MemorySaver, Annotation } from '@langchain/langgraph';
+import { onboardInstructorEssentialsSchema } from './onboardInstructor.js';
 import readline from 'readline';
 import dotenv from 'dotenv';
 
@@ -90,13 +91,9 @@ async function callModel(state: typeof StateAnnotation.State) {
   const onboardingData = state.onboardingData;
 
   // Construct a system message that guides the model to collect missing information
-  const systemMessage = new SystemMessage(`You are an onboarding assistant for a business management platform. Your task is to collect the following information from the user:
+  const systemMessage = new SystemMessage(`You are an onboarding assistant for a business management platform. Your task is to collect the information from the user, based on the following schema:
 
-1. Business name
-2. First service details (name, price, currency, duration in minutes)
-3. Business hours for each day of the week
-4. Email address
-5. Whether they want us to take payments directly from customers
+${JSON.stringify(onboardInstructorEssentialsSchema, null, 2)}
 
 Current progress:
 ${JSON.stringify(onboardingData, null, 2)}

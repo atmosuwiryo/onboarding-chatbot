@@ -2,17 +2,16 @@ import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from '@langchain/
 import { ChatAnthropic } from '@langchain/anthropic';
 import { StateGraph } from '@langchain/langgraph';
 import { MemorySaver, Annotation } from '@langchain/langgraph';
-import { onboardInstructorEssentialsSchema } from './onboardInstructor.js';
+import { onboardInstructorEssentialsSchema, OnboardTenantEssentials } from './onboardInstructor.js';
 import readline from 'readline';
 import dotenv from 'dotenv';
+import { tool } from '@langchain/core/tools';
 
 dotenv.config();
 
 // Set LangChain environment variables programmatically
 process.env.LANGCHAIN_TRACING_V2 = process.env.LANGCHAIN_TRACING_V2 || 'true';
-// eslint-disable-next-line no-self-assign
 process.env.LANGCHAIN_API_KEY = process.env.LANGCHAIN_API_KEY;
-// eslint-disable-next-line no-self-assign
 process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // Add DEBUG environment variable
@@ -36,32 +35,23 @@ const StateAnnotation = Annotation.Root({
     reducer: (prev, next) => ({ ...prev, ...next }),
   }),
 });
-
 debugLog('StateAnnotation defined');
-
-interface OnboardTenantEssentials {
-  businessName: string;
-  firstServices: {
-    serviceName: string;
-    price: number;
-    priceCurrency: string;
-    durationInMinutes: number;
-  };
-  businessHours: Array<{
-    startTime24hr: string;
-    endTime24hr: string;
-    dayOfWeek: 'Monday' | 'Tuesday' | 'Wednesday' | 'Thursday' | 'Friday' | 'Saturday' | 'Sunday';
-  }>;
-  yourEmailAddress: string;
-  doYouWantUsToTakePaymentsDirectlyFromYourCustomers: boolean;
-}
-
 debugLog('OnboardTenantEssentials interface defined');
+
+const onboardingTool = tool((input) => {
+  console.log(input);
+  return input;
+}, {
+  name: 'onboarding',
+  description: 'Get onboarding data from user',
+  schema: onboardInstructorEssentialsSchema
+});
+
 
 const model = new ChatAnthropic({
   model: 'claude-3-5-sonnet-20240620',
   temperature: 0,
-});
+}).bindTools([onboardingTool]);
 
 debugLog('ChatAnthropic model initialized');
 
@@ -77,10 +67,13 @@ function shouldContinue(state: typeof StateAnnotation.State) {
     onboardingData.doYouWantUsToTakePaymentsDirectlyFromYourCustomers !== undefined
   ) {
     debugLog('Onboarding complete. Ending process.');
-    return '__end__';
+    console.log('complete: onboardingData');
+    console.log(JSON.stringify(onboardingData, null, 2));
+    return 'onboarding';
   }
   debugLog('Onboarding incomplete. Continuing process.');
-  // return "agent";
+  console.log('incomplete: onboardingData');
+  console.log(JSON.stringify(onboardingData, null, 2));
   return '__end__';
 }
 
@@ -91,14 +84,18 @@ async function callModel(state: typeof StateAnnotation.State) {
   const onboardingData = state.onboardingData;
 
   // Construct a system message that guides the model to collect missing information
-  const systemMessage = new SystemMessage(`You are an onboarding assistant for a business management platform. Your task is to collect the information from the user, based on the following schema:
+  const systemMessage = new SystemMessage(`
+You are an onboarding assistant for a business management platform.
+Your task is to collect the information from the user, based on the following schema:
 
 ${JSON.stringify(onboardInstructorEssentialsSchema, null, 2)}
 
 Current progress:
 ${JSON.stringify(onboardingData, null, 2)}
 
-Please ask for any missing information one at a time. Be conversational and friendly.`);
+Please ask for any missing information one at a time.
+Don't follow user question not related to onboarding.
+Be conversational and friendly.`);
 
   debugLog('System message created');
 
@@ -114,6 +111,7 @@ Please ask for any missing information one at a time. Be conversational and frie
 
   // Parse the response to extract any new information
   debugLog('Parsing AI response for new data...');
+  console.log(response);
   const newData = parseResponseForData(response.content);
   debugLog('New data parsed:', newData);
 
@@ -145,6 +143,7 @@ function parseResponseForData(content: string | object): Partial<OnboardTenantEs
 debugLog('Defining StateGraph...');
 const workflow = new StateGraph(StateAnnotation)
   .addNode('agent', callModel)
+  .addNode('onboarding', onboardingTool)
   .addEdge('__start__', 'agent')
   .addConditionalEdges('agent', shouldContinue);
 
@@ -175,6 +174,18 @@ async function main() {
   debugLog('Thread ID:', threadId);
   const conversationHistory: BaseMessage[] = [];
 
+  debugLog('Starting conversation...');
+  let finalState = await app.invoke(
+    { 
+      messages: [new HumanMessage('Start onboarding')],
+      onboardingData: {} // Initialize with empty object on first run
+    },
+    { configurable: { thread_id: threadId } }
+  );
+  const botResponse = finalState.messages[finalState.messages.length - 1].content; // Get the new assistant message
+  // console.log("Bot response:", botResponse);
+  console.log('\x1b[33m%s\x1b[0m', `Bot: ${typeof botResponse === 'string' ? botResponse : JSON.stringify(botResponse)}`);
+
   while (continueConversation) {
     debugLog('Waiting for user input...');
     const userMessage = await askQuestion('You: ');
@@ -190,7 +201,7 @@ async function main() {
     conversationHistory.push(userHumanMessage);
 
     debugLog('Invoking app with user message...');
-    const finalState = await app.invoke(
+    finalState = await app.invoke(
       { 
         messages: [userHumanMessage],
         onboardingData: {} // Initialize with empty object on first run

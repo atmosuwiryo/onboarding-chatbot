@@ -1,11 +1,12 @@
 import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { ChatAnthropic } from '@langchain/anthropic';
-import { StateGraph } from '@langchain/langgraph';
+import { END, START, StateGraph } from '@langchain/langgraph';
 import { MemorySaver, Annotation } from '@langchain/langgraph';
-import { onboardInstructorEssentialsSchema, OnboardTenantEssentials } from './onboardInstructor.js';
+import { onboardInstructorEssentialsSchema } from './onboardInstructor.js';
 import readline from 'readline';
 import dotenv from 'dotenv';
 import { tool } from '@langchain/core/tools';
+import { ToolNode } from '@langchain/langgraph/prebuilt';
 
 dotenv.config();
 
@@ -23,65 +24,63 @@ function debugLog(...args: unknown[]) {
     console.log(...args);
   }
 }
-
 debugLog('Environment variables set');
+
+let isCompleted = false;
 
 // Define the graph state
 const StateAnnotation = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
     reducer: (x, y) => x.concat(y),
   }),
-  onboardingData: Annotation<Partial<OnboardTenantEssentials>>({
-    reducer: (prev, next) => ({ ...prev, ...next }),
-  }),
 });
 debugLog('StateAnnotation defined');
-debugLog('OnboardTenantEssentials interface defined');
 
-const onboardingTool = tool((input) => {
-  console.log(input);
+const onboardingCompleted = tool((input) => {
+  debugLog('Onboarding completed');
+  isCompleted = true;
+
+  // TODO: POST to endpoint
   return input;
 }, {
-  name: 'onboarding',
-  description: 'Get onboarding data from user',
-  schema: onboardInstructorEssentialsSchema
+  name: 'complete',
+  description: 'Mark onboarding as completed with onboarding data provided',
+  schema: onboardInstructorEssentialsSchema,
 });
 
+const tools = [onboardingCompleted];
+debugLog('Tools defined');
 
 const model = new ChatAnthropic({
   model: 'claude-3-5-sonnet-20240620',
   temperature: 0,
-}).bindTools([onboardingTool]);
-
+}).bindTools(tools);
 debugLog('ChatAnthropic model initialized');
+
+const toolNodeForGraph = new ToolNode(tools);
 
 // Define the function that determines whether to continue or not
 function shouldContinue(state: typeof StateAnnotation.State) {
   debugLog('Checking if onboarding should continue...');
-  const onboardingData = state.onboardingData;
+
+  const lastMessage = state.messages[state.messages.length - 1];
+
+  // If the LLM makes a tool call, then we route to the "tools" node
   if (
-    onboardingData.businessName &&
-    onboardingData.firstServices &&
-    onboardingData.businessHours &&
-    onboardingData.yourEmailAddress !== undefined &&
-    onboardingData.doYouWantUsToTakePaymentsDirectlyFromYourCustomers !== undefined
-  ) {
-    debugLog('Onboarding complete. Ending process.');
-    console.log('complete: onboardingData');
-    console.log(JSON.stringify(onboardingData, null, 2));
-    return 'onboarding';
+    'tool_calls' in lastMessage&&
+    Array.isArray(lastMessage.tool_calls) &&
+    lastMessage.tool_calls?.length) {
+    return 'tools';
   }
-  debugLog('Onboarding incomplete. Continuing process.');
-  console.log('incomplete: onboardingData');
-  console.log(JSON.stringify(onboardingData, null, 2));
-  return '__end__';
+
+  // Back to ask for user input
+  return END;
 }
 
 // Define the function that calls the model
 async function callModel(state: typeof StateAnnotation.State) {
   debugLog('Calling AI model...');
   const messages = state.messages;
-  const onboardingData = state.onboardingData;
 
   // Construct a system message that guides the model to collect missing information
   const systemMessage = new SystemMessage(`
@@ -90,63 +89,34 @@ Your task is to collect the information from the user, based on the following sc
 
 ${JSON.stringify(onboardInstructorEssentialsSchema, null, 2)}
 
-Current progress:
-${JSON.stringify(onboardingData, null, 2)}
-
 Please ask for any missing information one at a time.
 Don't follow user question not related to onboarding.
-Be conversational and friendly.`);
+Be conversational, short but friendly.`);
 
   debugLog('System message created');
 
   // Prepare the messages for the model
-  // const modelMessages = [systemMessage, ...messages.slice(-1)]; // Only include the last user message
   const modelMessages = [systemMessage, ...messages]; // Only include the last user message
-  // const modelMessages = messages; // Only include the last user message
   debugLog('model messages prepared:', modelMessages);
 
   debugLog('Invoking AI model...');
   const response = await model.invoke(modelMessages);
   debugLog('AI model response received');
 
-  // Parse the response to extract any new information
-  debugLog('Parsing AI response for new data...');
-  console.log(response);
-  const newData = parseResponseForData(response.content);
-  debugLog('New data parsed:', newData);
-
   return { 
     messages: [response], // Only return the new assistant message
-    onboardingData: newData
   };
 }
 
-function parseResponseForData(content: string | object): Partial<OnboardTenantEssentials> {
-  debugLog('Parsing response for onboarding data...');
-  // Convert content to string if it's an object
-  const contentString = typeof content === 'object' ? JSON.stringify(content) : content;
-  
-  const newData: Partial<OnboardTenantEssentials> = {};
-
-  if (contentString.includes('business name') && contentString.includes(':')) {
-    newData.businessName = contentString.split(':')[1].trim();
-    debugLog('Extracted business name:', newData.businessName);
-  }
-
-  // Add more parsing logic for other fields...
-
-  debugLog('Parsed data:', newData);
-  return newData;
-}
 
 // Define a new graph
 debugLog('Defining StateGraph...');
 const workflow = new StateGraph(StateAnnotation)
   .addNode('agent', callModel)
-  .addNode('onboarding', onboardingTool)
-  .addEdge('__start__', 'agent')
+  .addNode('tools', toolNodeForGraph)
+  .addEdge(START, 'agent')
+  .addEdge('tools', END)
   .addConditionalEdges('agent', shouldContinue);
-
 debugLog('StateGraph defined');
 
 // Initialize memory to persist state between graph runs
@@ -160,6 +130,8 @@ debugLog('Graph compiled');
 
 async function main() {
   debugLog('Starting main function...');
+
+  // If onboarding has already been completed, exit
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -178,17 +150,18 @@ async function main() {
   let finalState = await app.invoke(
     { 
       messages: [new HumanMessage('Start onboarding')],
-      onboardingData: {} // Initialize with empty object on first run
     },
     { configurable: { thread_id: threadId } }
   );
   const botResponse = finalState.messages[finalState.messages.length - 1].content; // Get the new assistant message
-  // console.log("Bot response:", botResponse);
   console.log('\x1b[33m%s\x1b[0m', `Bot: ${typeof botResponse === 'string' ? botResponse : JSON.stringify(botResponse)}`);
 
   while (continueConversation) {
+
     debugLog('Waiting for user input...');
     const userMessage = await askQuestion('You: ');
+    debugLog('User message received:', userMessage);
+
     if (userMessage.toLowerCase() === 'exit') {
       continueConversation = false;
       debugLog('User requested to exit. Ending conversation.');
@@ -196,7 +169,6 @@ async function main() {
       break;
     }
 
-    debugLog('User message received:', userMessage);
     const userHumanMessage = new HumanMessage(userMessage);
     conversationHistory.push(userHumanMessage);
 
@@ -204,25 +176,25 @@ async function main() {
     finalState = await app.invoke(
       { 
         messages: [userHumanMessage],
-        onboardingData: {} // Initialize with empty object on first run
       },
       { configurable: { thread_id: threadId } }
     );
     debugLog('App invocation complete');
 
     const botResponse = finalState.messages[finalState.messages.length - 1].content; // Get the new assistant message
-    // console.log("Bot response:", botResponse);
     console.log('\x1b[33m%s\x1b[0m', `Bot: ${typeof botResponse === 'string' ? botResponse : JSON.stringify(botResponse)}`);
 
     // Add the bot's response to the conversation history
     conversationHistory.push(new AIMessage(botResponse));
 
-    // if (shouldContinue(finalState) === "__end__") {
-    //   debugLog("Onboarding complete. Displaying collected information:");
-    //   debugLog(JSON.stringify(finalState.onboardingData, null, 2));
-    //   continueConversation = false;
-    //   rl.close();
-    // }
+    // If onboarding has already been completed, exit
+    if (isCompleted)
+    {
+      continueConversation = false;
+      console.log('\x1b[32m%s\x1b[0m', 'Onboarding completed!');
+      rl.close();
+    }
+
   }
 
   debugLog('Main function completed');

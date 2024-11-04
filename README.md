@@ -24,3 +24,7 @@ A Proof of Concept implementation of a conversational onboarding flow using Lang
   ```bash
   tsx src/onboarding-chatbot.ts
   ```
+
+## Preview
+
+![](https://raw.githubusercontent.com/atmosuwiryo/onboarding-chatbot/main/assets/preview.gif)
